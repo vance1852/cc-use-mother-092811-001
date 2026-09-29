@@ -9,22 +9,26 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
-from .service import DomainService
+from .portfolio import PortfolioService
 from .storage import Database
 
 
-def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
+def route(service: PortfolioService, method: str, path: str, body: dict[str, Any] | None,
           headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    query = parse_qs(parsed.query)
     actor_id = headers.get("X-Actor-Id", "")
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
+
+        # ------------------------------------------------ 基础登记
         if method == "POST" and parsed.path == "/organizations":
             receipt = service.register_organization(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
@@ -38,16 +42,65 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             receipt = service.record_domain_data(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
         if method == "GET" and parsed.path == "/domain-records":
-            query = parse_qs(parsed.query)
             site_id = query.get("site_id", [""])[0]
             if not site_id:
                 raise ValidationError("site_id 不能为空")
             category = query.get("category", [None])[0]
             return 200, {"items": [item.__dict__ for item in service.list_domain_data(site_id, category)]}
         if method == "GET" and parsed.path == "/audit-events":
-            query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+
+        # ------------------------------------------------ 通道组合登记
+        if method == "POST" and parsed.path == "/nodes":
+            result = service.register_node(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/edges":
+            result = service.register_edge(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/gaps":
+            result = service.register_gap(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/service-areas":
+            result = service.register_service_area(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/policy-targets":
+            result = service.register_policy_target(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/projects":
+            result = service.register_project(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/project-adjustments":
+            result = service.adjust_project(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "GET" and len(segments) == 3 and segments[0] == "projects":
+            if segments[2] == "versions":
+                return 200, {"items": service.list_project_versions(segments[1])}
+        if method == "GET" and parsed.path == "/lineage":
+            project_id = query.get("project_id", [None])[0]
+            return 200, {"items": service.list_lineage(project_id)}
+
+        # ------------------------------------------------ 评审轮与方案
+        if method == "POST" and parsed.path == "/rounds":
+            result = service.create_round(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and len(segments) == 3 and segments[0] == "rounds" and segments[2] == "freeze":
+            return 200, service.freeze_round(actor_id=actor_id, round_id=segments[1])
+        if method == "GET" and len(segments) == 2 and segments[0] == "rounds":
+            return 200, service.get_round(segments[1])
+        if method == "GET" and len(segments) == 3 and segments[0] == "rounds" and segments[2] == "proposals":
+            return 200, service.list_round_proposals(segments[1])
+        if method == "POST" and parsed.path == "/proposals":
+            result = service.create_proposal(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "GET" and len(segments) == 2 and segments[0] == "proposals":
+            return 200, service.get_proposal(segments[1])
+        if method == "POST" and len(segments) == 3 and segments[0] == "proposals" and segments[2] == "sign":
+            result = service.sign_proposal(actor_id=actor_id, proposal_id=segments[1], **body)
+            return 200, result
+        if method == "POST" and len(segments) == 3 and segments[0] == "proposals" and segments[2] == "recalculate":
+            return 200, service.recalculate_proposal(segments[1], body.get("items"))
+
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -58,7 +111,7 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
-    service: DomainService
+    service: PortfolioService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -93,13 +146,13 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     """启动本地 HTTP 服务。"""
 
-    parser = argparse.ArgumentParser(description="启动技能赛训协作基础服务")
+    parser = argparse.ArgumentParser(description="启动通道项目组合决策服务")
     parser.add_argument("--database", default="service.sqlite3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = PortfolioService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
